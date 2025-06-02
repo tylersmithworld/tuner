@@ -2,8 +2,8 @@
   // --- CONFIG ---
   const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
   const A4 = 440;
-  const TUNE_WINDOW = 4;      // tight green zone
-  const VERTICAL_RANGE = window.innerHeight * 0.4;
+  const TUNE_WINDOW = 4;      // smaller = tighter green zone (even harder to hit!)
+  const VERTICAL_RANGE = window.innerHeight * 0.4; // note travels up to ~40% of screen
 
   // --- ELEMENTS ---
   const canvas = document.getElementById('canvas');
@@ -68,22 +68,19 @@
   }
 
   let noteDisplay = { name: '', octave: '', cents: 0, midi: 0, freq: 0 };
-  let inTune = false, smoothCents = 0, showNote = false, centsValue = 0;
+  let inTune = false, lastFreq = 0, smoothCents = 0, everDetected = false;
 
   function updatePitch() {
     if (!running) return;
     analyser.getFloatTimeDomainData(data);
     let freq = autoCorrelate(data, audioCtx.sampleRate);
     if (freq > 0) {
+      everDetected = true;
+      lastFreq = freq;
       let n = freqToNote(freq);
       noteDisplay = { ...n, freq };
-      centsValue = n.cents;
       smoothCents += ((n.cents) - smoothCents) * 0.12;
       inTune = Math.abs(n.cents) < TUNE_WINDOW;
-      showNote = inTune;
-    } else {
-      showNote = false;
-      centsValue = 0;
     }
     setTimeout(updatePitch, 60);
   }
@@ -99,7 +96,7 @@
       let src = audioCtx.createMediaStreamSource(micStream);
       src.connect(analyser);
       running = true;
-      showNote = false;
+      everDetected = false;
       updatePitch();
       animate();
     } catch (e) {
@@ -113,24 +110,7 @@
     let cx = canvas.width / 2;
     let cy = canvas.height / 2;
 
-    // Overlay logic
-    if (!inTune && noteDisplay.name) {
-      if (centsValue > TUNE_WINDOW) {
-        // Sharp = yellow (RGBA)
-        ctx.save();
-        ctx.fillStyle = "rgba(255, 200, 30, 0.15)";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.restore();
-      } else if (centsValue < -TUNE_WINDOW) {
-        // Flat = blue
-        ctx.save();
-        ctx.fillStyle = "rgba(30, 100, 255, 0.13)";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.restore();
-      }
-    }
-
-    // Subtle horizontal center line
+    // Light, subtle horizontal center line
     ctx.save();
     ctx.strokeStyle = "rgba(255,119,0,0.11)";
     ctx.lineWidth = 3;
@@ -140,27 +120,36 @@
     ctx.stroke();
     ctx.restore();
 
-    // Draw only when inTune (showNote)
-    if (showNote) {
-      let offsetY = Math.max(-1, Math.min(1, smoothCents / 50)) * VERTICAL_RANGE;
-      ctx.save();
-      ctx.font = `${Math.floor(canvas.height * 0.18)}px 'Bebas Neue', sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.shadowColor = "#13d35c";
-      ctx.shadowBlur = 28;
-      ctx.globalAlpha = 1.0;
-      ctx.fillStyle = "#13d35c";
-      ctx.fillText(noteDisplay.name || "–", cx, cy + offsetY);
+    // Compute offset; map +/- 50 cents to the whole VERTICAL_RANGE (for big movement)
+    let offsetY = Math.max(-1, Math.min(1, smoothCents / 50)) * VERTICAL_RANGE;
 
-      // Octave and frequency display (optional)
-      ctx.font = `${Math.floor(canvas.height * 0.04)}px 'Bebas Neue', sans-serif`;
-      ctx.globalAlpha = 0.7;
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = "#ff7700";
+    // Opacity: always 0.7 unless in the green zone, then 1.0
+    let useAlpha = inTune ? 1.0 : 0.7;
+
+    // "Don’t start green": only green if (a) inTune AND (b) everDetected a real note
+    let showGreen = inTune && everDetected;
+
+    // Draw note
+    ctx.save();
+    ctx.font = `${Math.floor(canvas.height * 0.18)}px 'Bebas Neue', sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.shadowColor = showGreen ? "#13d35c" : "#000";
+    ctx.shadowBlur = showGreen ? 28 : 0;
+    ctx.globalAlpha = useAlpha;
+    ctx.fillStyle = showGreen ? "#13d35c" : "#fff";
+    ctx.fillText(noteDisplay.name || "–", cx, cy + offsetY);
+
+    // Octave and frequency display (optional)
+    ctx.font = `${Math.floor(canvas.height * 0.04)}px 'Bebas Neue', sans-serif`;
+    ctx.globalAlpha = useAlpha * 0.7;
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ff7700";
+    if (noteDisplay.octave !== '' && noteDisplay.freq)
       ctx.fillText("Oct " + noteDisplay.octave + "  " + noteDisplay.freq.toFixed(1) + " Hz", cx, cy + offsetY + canvas.height * 0.12);
-      ctx.restore();
-    }
+
+    ctx.restore();
+
     if (running) requestAnimationFrame(animate);
   }
 
@@ -168,3 +157,6 @@
     if (document.hidden) running = false;
   });
 </script>
+
+</body>
+</html>
