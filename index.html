@@ -89,7 +89,8 @@
       let b = (x3 - x1)/2;
       if (a) T0 = T0 - b/(2*a);
       let freq = sampleRate / T0;
-      if (freq > 82 && freq < 1100) return freq;
+      if (freq > 40 && freq < 4200) return freq; // Good for most musicians!
+;
       return -1;
     }
 
