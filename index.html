@@ -11,7 +11,7 @@
       height: 100%; width: 100%;
       touch-action: none;
     }
-    body { height: 100vh; width: 100vw; }
+    body { height: 100vh; width: 100vw; background: #000;}
     canvas { display: block; background: #000; }
     #tune-btn {
       position: fixed; bottom: 32px; left: 50%; transform: translateX(-50%);
@@ -30,40 +30,40 @@
   <canvas id="canvas"></canvas>
   <button id="tune-btn">Tap to Tune</button>
   <script>
-    // --- CONFIG ---
     const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
     const A4 = 440;
-    const TUNE_WINDOW = 7; // in cents for "green" glow
-    const VERTICAL_RANGE = 80; // px for max sharp/flat swing
+    const TUNE_WINDOW = 5; // ±5 cents for green
+    let VERTICAL_RANGE = 0;
 
-    // --- ELEMENTS ---
     const canvas = document.getElementById('canvas');
     const ctx = canvas.getContext('2d');
     const tuneBtn = document.getElementById('tune-btn');
 
-    // --- LAYOUT ---
     function resize() {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
+      // Use 44% of the height in both directions (top to bottom)
+      VERTICAL_RANGE = Math.floor(canvas.height * 0.44);
     }
     window.addEventListener('resize', resize);
     resize();
 
-    // --- PITCH DETECTION ---
-    let audioCtx, analyser, mic, data, running = false;
+    // State
+    let audioCtx, analyser, micStream, data, running = false;
     const bufLen = 2048;
     data = new Float32Array(bufLen);
 
+    let noteDisplay = null;
+    let inTune = false, smoothCents = 0, targetCents = 0, animNote = null;
+    let lastNoteName = '', lastFadeOut = 0, fadeAlpha = 0, fadeAnim = false;
+
+    // Utilities
     function autoCorrelate(buf, sampleRate) {
-      // Autocorrelation method for pitch detection
       let SIZE = buf.length;
       let rms = 0;
-      for (let i = 0; i < SIZE; i++) {
-        let val = buf[i];
-        rms += val * val;
-      }
+      for (let i = 0; i < SIZE; i++) rms += buf[i] * buf[i];
       rms = Math.sqrt(rms/SIZE);
-      if (rms < 0.01) return -1; // signal too weak
+      if (rms < 0.01) return -1;
 
       let r1 = 0, r2 = SIZE - 1, thres = 0.2;
       for (let i = 0; i < SIZE/2; i++) if (Math.abs(buf[i]) < thres) { r1 = i; break; }
@@ -77,120 +77,166 @@
         for (let j = 0; j < SIZE - i; j++)
           c[i] = c[i] + buf[j] * buf[j+i];
 
-      let d = 0; while (c[d] > c[d+1]) d++;
+      let d = 0; while (d < SIZE - 1 && c[d] > c[d+1]) d++;
       let maxval = -1, maxpos = -1;
       for (let i = d; i < SIZE; i++) {
         if (c[i] > maxval) { maxval = c[i]; maxpos = i; }
       }
       let T0 = maxpos;
-
-      // Interpolation for better precision
-      let x1 = c[T0-1], x2 = c[T0], x3 = c[T0+1];
+      if (T0 <= 0) return -1;
+      let x1 = c[T0-1] || 0, x2 = c[T0], x3 = c[T0+1] || 0;
       let a = (x1 + x3 - 2*x2)/2;
       let b = (x3 - x1)/2;
       if (a) T0 = T0 - b/(2*a);
-
       let freq = sampleRate / T0;
-      if (freq > 82 && freq < 1100) return freq; // E2 to C6 (guitar/piano)
+      if (freq > 82 && freq < 1100) return freq;
       return -1;
     }
 
     function freqToNote(f) {
       const n = 12 * (Math.log2(f / A4));
-      const noteNum = Math.round(n) + 57; // 57 = A4 midi
-      const name = NOTE_NAMES[(noteNum + 12*10) % 12]; // force positive index
+      const noteNum = Math.round(n) + 57;
+      const name = NOTE_NAMES[(noteNum + 12*10) % 12];
       const octave = Math.floor(noteNum / 12);
       const diff = n - Math.round(n);
       const cents = Math.floor(diff * 100);
-      return { name, octave, cents: Math.floor((n - Math.round(n)) * 100), midi: noteNum };
+      return { name, octave, cents: Math.floor((n - Math.round(n)) * 100), midi: noteNum, freq: f };
     }
-
-    let noteDisplay = { name: '', octave: '', cents: 0, midi: 0, freq: 0 };
-    let inTune = false, lastFreq = 0, smoothCents = 0;
 
     function updatePitch() {
       if (!running) return;
       analyser.getFloatTimeDomainData(data);
       let freq = autoCorrelate(data, audioCtx.sampleRate);
       if (freq > 0) {
-        lastFreq = freq;
         let n = freqToNote(freq);
-        noteDisplay = { ...n, freq };
-        // Smooth cents (animation)
-        smoothCents += ((n.cents) - smoothCents) * 0.25;
-        inTune = Math.abs(n.cents) < TUNE_WINDOW;
+        noteDisplay = { ...n };
+        targetCents = n.cents;
+        inTune = Math.abs(n.cents) <= TUNE_WINDOW;
+        if (lastNoteName !== n.name) {
+          lastNoteName = n.name;
+          fadeAlpha = 1.0; // reset alpha on new note
+        }
+        fadeAnim = false;
+        lastFadeOut = 0;
+      } else {
+        // Start fade out if previously had a note
+        if (noteDisplay && !fadeAnim) {
+          fadeAnim = true;
+          lastFadeOut = Date.now();
+        }
       }
       setTimeout(updatePitch, 60);
     }
 
-    // --- UI CONTROLS ---
+    // Animation for smooth movement and fade out
+    function animate() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw center horizontal line
+      let cx = canvas.width / 2;
+      let cy = canvas.height / 2;
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,119,0,0.13)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(0, cy);
+      ctx.lineTo(canvas.width, cy);
+      ctx.stroke();
+      ctx.restore();
+
+      // No note: nothing shown
+      if (!noteDisplay && !fadeAnim) {
+        requestAnimationFrame(animate);
+        return;
+      }
+
+      // Smooth cents slide
+      smoothCents += ((targetCents) - smoothCents) * 0.10;
+
+      // Opacity and color
+      let letterAlpha = 1.0;
+      let noteColor = "#13d35c";
+      if (!inTune) {
+        noteColor = "#fff";
+        letterAlpha = 0.6;
+      }
+      // If fading, fade out the letter smoothly
+      if (fadeAnim) {
+        let dt = (Date.now() - lastFadeOut) / 400; // fade duration ms
+        letterAlpha = Math.max(0, 1.0 - dt);
+        if (letterAlpha <= 0.01) {
+          noteDisplay = null;
+          fadeAnim = false;
+          smoothCents = 0;
+          targetCents = 0;
+        }
+      }
+
+      // Use almost all vertical range: full ±50 cents = full VERTICAL_RANGE
+      let offsetY = Math.max(-1, Math.min(1, smoothCents / 50)) * VERTICAL_RANGE;
+
+      // Draw note letter
+      ctx.save();
+      ctx.font = `${Math.floor(canvas.height * 0.19)}px 'Bebas Neue', sans-serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.shadowColor = (inTune && !fadeAnim) ? "#13d35c" : "#000";
+      ctx.shadowBlur = (inTune && !fadeAnim) ? 28 : 0;
+      ctx.globalAlpha = letterAlpha;
+      ctx.fillStyle = noteColor;
+      let displayLetter = (noteDisplay && noteDisplay.name) ? noteDisplay.name : '';
+      ctx.fillText(displayLetter, cx, cy + offsetY);
+
+      // Octave and frequency label (optional: shows only when not fading)
+      if (noteDisplay && !fadeAnim) {
+        ctx.font = `${Math.floor(canvas.height * 0.045)}px 'Bebas Neue', sans-serif`;
+        ctx.globalAlpha = letterAlpha * 0.74;
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "#ff7700";
+        ctx.fillText("Oct " + noteDisplay.octave + "   " + noteDisplay.freq.toFixed(1) + " Hz", cx, cy + offsetY + canvas.height * 0.12);
+      }
+      ctx.restore();
+
+      requestAnimationFrame(animate);
+    }
+
+    // Startup: totally blank except for button and line
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let cx = canvas.width / 2, cy = canvas.height / 2;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,119,0,0.13)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(0, cy);
+    ctx.lineTo(canvas.width, cy);
+    ctx.stroke();
+    ctx.restore();
+
     tuneBtn.addEventListener('click', async () => {
       if (running) return;
       tuneBtn.classList.add('hide');
-      // Start mic, context
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       analyser = audioCtx.createAnalyser();
       analyser.fftSize = bufLen;
       try {
-        mic = await navigator.mediaDevices.getUserMedia({ audio: true });
-        let src = audioCtx.createMediaStreamSource(mic);
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        let src = audioCtx.createMediaStreamSource(micStream);
         src.connect(analyser);
         running = true;
-        updatePitch();
+        noteDisplay = null;
+        smoothCents = 0;
+        fadeAnim = false;
         animate();
+        updatePitch();
       } catch (e) {
         alert('Mic access needed for tuner.');
         tuneBtn.classList.remove('hide');
       }
     });
 
-    // --- VISUALS ---
-    function animate() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Draw center line
-      let cx = canvas.width / 2;
-      let cy = canvas.height / 2;
-      ctx.strokeStyle = "#ff7700";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(0, cy);
-      ctx.lineTo(canvas.width, cy);
-      ctx.stroke();
-
-      // Draw note name, sliding vertically by cents error
-      let offsetY = Math.max(-1, Math.min(1, smoothCents / 50)) * VERTICAL_RANGE;
-      ctx.save();
-      ctx.font = `${Math.floor(canvas.height * 0.18)}px 'Bebas Neue', sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.shadowColor = inTune ? "#13d35c" : "#000";
-      ctx.shadowBlur = inTune ? 28 : 0;
-      ctx.fillStyle = inTune ? "#13d35c" : "#fff";
-      ctx.globalAlpha = 1;
-      ctx.fillText(noteDisplay.name || "–", cx, cy + offsetY);
-
-      // Octave and frequency display (optional)
-      ctx.font = `${Math.floor(canvas.height * 0.04)}px 'Bebas Neue', sans-serif`;
-      ctx.globalAlpha = 0.7;
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = "#ff7700";
-      if (noteDisplay.octave && noteDisplay.freq)
-        ctx.fillText("Oct " + noteDisplay.octave + "  " + noteDisplay.freq.toFixed(1) + " Hz", cx, cy + offsetY + canvas.height * 0.12);
-
-      // Draw cent offset bar (optional)
-      ctx.globalAlpha = 0.28;
-      ctx.fillRect(cx - 3, cy - VERTICAL_RANGE, 6, VERTICAL_RANGE * 2);
-      ctx.restore();
-
-      if (running) requestAnimationFrame(animate);
-    }
-
-    // --- KILL ANIMATION ON PAUSE ---
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) running = false;
     });
-
   </script>
 </body>
 </html>
